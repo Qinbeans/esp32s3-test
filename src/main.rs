@@ -3,74 +3,57 @@
 
 extern crate alloc;
 
-use crate::commands::read_command;
-use alloc::string::String;
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+};
 use embassy_executor::Spawner;
 use esp_backtrace as _;
 use esp_hal::{
-    delay::Delay,
     gpio::{Level, Output},
-    prelude::*,
+    rng::Rng,
+    timer::timg::TimerGroup,
     usb_serial_jtag::UsbSerialJtag,
-    Blocking,
 };
-use esp_println::println;
-use heapless::spsc::Queue;
+// use heapless::spsc::Queue;
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, channel::Channel, mutex::Mutex};
 
 mod commands;
-
-#[embassy_executor::task]
-async fn usb_thread(
-    mut usb_serial: UsbSerialJtag<'static, Blocking>,
-    mut queue: Queue<String, 10>,
-    mut user_led: Output<'static>,
-) {
-    let delay = Delay::new();
-
-    loop {
-        if let Some(data) = queue.dequeue() {
-            println!("Sending command: {:?}", data);
-        }
-        let command = read_command(&mut usb_serial);
-
-        match command {
-            commands::Commands::Init => {
-                println!("0");
-            }
-            commands::Commands::LightOn => {
-                user_led.set_low();
-                println!("0");
-            }
-            commands::Commands::LightOff => {
-                user_led.set_high();
-                println!("0");
-            }
-            commands::Commands::WifiActivate => {
-                println!("0");
-            }
-            commands::Commands::WifiDeactivate => {
-                println!("0");
-            }
-            _ => {
-                println!("Unknown command");
-            }
-        }
-
-        delay.delay(500.millis());
-    }
-}
+mod loops;
 
 #[esp_hal_embassy::main]
-async fn main(spawner: Spawner) {
+pub async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
     esp_alloc::heap_allocator!(72 * 1024);
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
     let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
-    let user_led = Output::new(peripherals.GPIO21, Level::High);
+    let user_led = Arc::new(Mutex::new(Output::new(peripherals.GPIO21, Level::High)));
 
-    let queue: Queue<String, 10> = Queue::new();
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
 
-    spawner.spawn(usb_thread(usb_serial, queue, user_led)).ok();
+    let queue: Arc<Channel<NoopRawMutex, String, 10>> = Arc::new(Channel::new());
+
+    let sender = queue.sender();
+
+    sender.send("init".to_string()).await;
+
+    spawner
+        .spawn(loops::usb_event::usb_thread(
+            usb_serial,
+            user_led.clone(),
+            queue.clone(),
+        ))
+        .ok();
+    spawner
+        .spawn(loops::wifi_event::esp_now_thread(
+            timg0,
+            Rng::new(peripherals.RNG),
+            peripherals.RADIO_CLK,
+            peripherals.WIFI,
+            user_led.clone(),
+            queue.clone(),
+        ))
+        .ok();
 }
